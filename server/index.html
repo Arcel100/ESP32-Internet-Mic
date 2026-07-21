@@ -2,20 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1"
-    >
-
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#111827">
-
     <title>ESP32 Internet Mic</title>
 
     <style>
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         body {
             margin: 0;
@@ -23,20 +15,9 @@
             display: grid;
             place-items: center;
             padding: 24px;
-            font-family:
-                Inter,
-                system-ui,
-                -apple-system,
-                BlinkMacSystemFont,
-                "Segoe UI",
-                sans-serif;
+            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             color: #f9fafb;
-            background:
-                radial-gradient(
-                    circle at top,
-                    #243047,
-                    #111827 55%
-                );
+            background: radial-gradient(circle at top, #243047, #111827 55%);
         }
 
         main {
@@ -45,8 +26,7 @@
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 24px;
             background: rgba(31, 41, 55, 0.92);
-            box-shadow:
-                0 24px 70px rgba(0, 0, 0, 0.38);
+            box-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
             backdrop-filter: blur(16px);
         }
 
@@ -63,7 +43,8 @@
             line-height: 1.6;
         }
 
-        .status-card {
+        .status-card,
+        .controls-card {
             display: grid;
             gap: 16px;
             padding: 20px;
@@ -71,32 +52,23 @@
             background: rgba(17, 24, 39, 0.72);
         }
 
-        .status-row {
+        .controls-card { margin-top: 20px; }
+
+        .status-row,
+        .control-heading {
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 16px;
         }
 
-        .label {
-            color: #9ca3af;
-        }
+        .label { color: #9ca3af; }
 
-        [data-state="connected"] {
-            color: #4ade80;
-        }
+        [data-state="connected"] { color: #4ade80; }
+        [data-state="connecting"] { color: #facc15; }
+        [data-state="disconnected"] { color: #f87171; }
 
-        [data-state="connecting"] {
-            color: #facc15;
-        }
-
-        [data-state="disconnected"] {
-            color: #f87171;
-        }
-
-        .meter {
-            margin-top: 24px;
-        }
+        .meter { margin-top: 24px; }
 
         .meter-heading {
             display: flex;
@@ -116,13 +88,7 @@
 
         progress::-moz-progress-bar {
             border-radius: 999px;
-            background:
-                linear-gradient(
-                    90deg,
-                    #22c55e,
-                    #eab308,
-                    #ef4444
-                );
+            background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
         }
 
         progress::-webkit-progress-bar {
@@ -132,13 +98,37 @@
 
         progress::-webkit-progress-value {
             border-radius: 999px;
-            background:
-                linear-gradient(
-                    90deg,
-                    #22c55e,
-                    #eab308,
-                    #ef4444
-                );
+            background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
+        }
+
+        .control-group {
+            display: grid;
+            gap: 10px;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            accent-color: #4ade80;
+        }
+
+        .switch-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+
+        .switch-row input {
+            width: 20px;
+            height: 20px;
+            accent-color: #4ade80;
+        }
+
+        .small-button {
+            min-height: 42px;
+            padding: 0 16px;
+            color: #f9fafb;
+            background: #374151;
         }
 
         .buttons {
@@ -155,14 +145,10 @@
             font: inherit;
             font-weight: 700;
             cursor: pointer;
-            transition:
-                transform 120ms ease,
-                opacity 120ms ease;
+            transition: transform 120ms ease, opacity 120ms ease;
         }
 
-        button:not(:disabled):active {
-            transform: scale(0.98);
-        }
+        button:not(:disabled):active { transform: scale(0.98); }
 
         button:disabled {
             cursor: not-allowed;
@@ -188,13 +174,8 @@
         }
 
         @media (max-width: 480px) {
-            main {
-                padding: 24px;
-            }
-
-            .buttons {
-                grid-template-columns: 1fr;
-            }
+            main { padding: 24px; }
+            .buttons { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -204,36 +185,22 @@
         <h1>Internet Mic</h1>
 
         <p class="subtitle">
-            Live audio streamed from an ESP32-S3
-            and INMP441 microphone.
+            Live audio streamed from an ESP32-S3 and INMP441 microphone.
         </p>
 
         <section class="status-card">
             <div class="status-row">
                 <span class="label">Player</span>
-
-                <strong
-                    id="connectionStatus"
-                    data-state="disconnected"
-                >
-                    Press Start Listening
-                </strong>
+                <strong id="connectionStatus" data-state="disconnected">Press Start Listening</strong>
             </div>
 
             <div class="status-row">
                 <span class="label">Microphone</span>
-
-                <strong
-                    id="microphoneStatus"
-                    data-state="disconnected"
-                >
-                    Disconnected
-                </strong>
+                <strong id="microphoneStatus" data-state="disconnected">Disconnected</strong>
             </div>
 
             <div class="status-row">
                 <span class="label">Listeners</span>
-
                 <strong id="listenerCount">0</strong>
             </div>
         </section>
@@ -243,31 +210,43 @@
                 <span class="label">Audio level</span>
                 <strong id="levelText">0%</strong>
             </div>
+            <progress id="audioLevel" value="0" max="100"></progress>
+        </section>
 
-            <progress
-                id="audioLevel"
-                value="0"
-                max="100"
-            ></progress>
+        <section class="controls-card">
+            <div class="control-group">
+                <div class="control-heading">
+                    <label for="micGain">Microphone gain</label>
+                    <strong id="micGainText">1.00×</strong>
+                </div>
+                <input id="micGain" type="range" min="0.25" max="3" step="0.05" value="1">
+            </div>
+
+            <div class="control-group">
+                <div class="control-heading">
+                    <label for="playbackVolume">Playback volume</label>
+                    <strong id="playbackVolumeText">70%</strong>
+                </div>
+                <input id="playbackVolume" type="range" min="0" max="1" step="0.01" value="0.7">
+            </div>
+
+            <label class="switch-row" for="limiterToggle">
+                <span>Limiter</span>
+                <input id="limiterToggle" type="checkbox" checked>
+            </label>
+
+            <button id="resetAudioButton" class="small-button" type="button">
+                Reset audio controls
+            </button>
         </section>
 
         <div class="buttons">
-            <button id="startButton" type="button">
-                Start Listening
-            </button>
-
-            <button
-                id="stopButton"
-                type="button"
-                disabled
-            >
-                Stop
-            </button>
+            <button id="startButton" type="button">Start Listening</button>
+            <button id="stopButton" type="button" disabled>Stop</button>
         </div>
 
         <p class="note">
-            Browsers require a button press before
-            allowing audio playback.
+            Gain and volume only affect this browser. Keep the limiter on when increasing gain.
         </p>
     </main>
 
