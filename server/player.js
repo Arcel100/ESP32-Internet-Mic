@@ -1,17 +1,5 @@
 "use strict";
 
-/*
- * ESP32 Internet Mic - Browser Audio Player
- *
- * Receives:
- *   Signed 16-bit little-endian PCM
- *   Mono
- *   16,000 Hz
- *
- * Audio path:
- *   WebSocket -> resampler -> AudioWorklet -> speakers
- */
-
 const SOURCE_SAMPLE_RATE = 16000;
 const RECONNECT_DELAY_MS = 2000;
 const START_BUFFER_SECONDS = 0.12;
@@ -25,28 +13,28 @@ const listenerCount = document.getElementById("listenerCount");
 const audioLevel = document.getElementById("audioLevel");
 const levelText = document.getElementById("levelText");
 
+const micGainSlider = document.getElementById("micGain");
+const micGainText = document.getElementById("micGainText");
+const playbackVolumeSlider = document.getElementById("playbackVolume");
+const playbackVolumeText = document.getElementById("playbackVolumeText");
+const limiterToggle = document.getElementById("limiterToggle");
+const resetAudioButton = document.getElementById("resetAudioButton");
+
 let audioContext = null;
 let workletNode = null;
+let micGainNode = null;
+let limiterNode = null;
+let outputGainNode = null;
 let webSocket = null;
 let resampler = null;
-
 let shouldReconnect = false;
 let reconnectTimer = null;
-let microphoneConnected = false;
-
-
-/* ---------------------------------------------------------
-   Streaming sample-rate converter
---------------------------------------------------------- */
 
 class StreamingResampler {
     constructor(inputRate, outputRate) {
         this.inputRate = inputRate;
         this.outputRate = outputRate;
-
-        // Distance through the source audio for each output sample.
         this.step = inputRate / outputRate;
-
         this.position = 0;
         this.previousSample = 0;
         this.hasPreviousSample = false;
@@ -79,14 +67,12 @@ class StreamingResampler {
             return new Float32Array(0);
         }
 
-        const estimatedLength = Math.ceil(
-            (source.length - 1 - this.position) / this.step
+        const estimatedLength = Math.max(
+            0,
+            Math.ceil((source.length - 1 - this.position) / this.step)
         );
 
-        const output = new Float32Array(
-            Math.max(0, estimatedLength)
-        );
-
+        const output = new Float32Array(estimatedLength);
         let outputIndex = 0;
 
         while (
@@ -94,11 +80,9 @@ class StreamingResampler {
             outputIndex < output.length
         ) {
             const leftIndex = Math.floor(this.position);
-            const rightIndex = leftIndex + 1;
             const fraction = this.position - leftIndex;
-
             const leftSample = source[leftIndex];
-            const rightSample = source[rightIndex];
+            const rightSample = source[leftIndex + 1];
 
             output[outputIndex] =
                 leftSample +
@@ -108,72 +92,42 @@ class StreamingResampler {
             this.position += this.step;
         }
 
-        // Preserve fractional position for the next packet.
         this.position -= source.length - 1;
         this.previousSample = source[source.length - 1];
 
-        if (outputIndex === output.length) {
-            return output;
-        }
-
-        return output.slice(0, outputIndex);
+        return outputIndex === output.length
+            ? output
+            : output.slice(0, outputIndex);
     }
 }
-
-
-/* ---------------------------------------------------------
-   AudioWorklet source
---------------------------------------------------------- */
 
 const workletSource = `
 class PCMStreamProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
-
         this.queue = [];
         this.queueOffset = 0;
         this.bufferedSamples = 0;
-
         this.started = false;
 
-        const processorOptions =
-            options.processorOptions || {};
-
-        this.startBufferSamples =
-            processorOptions.startBufferSamples || 4096;
-
-        this.maxBufferSamples =
-            processorOptions.maxBufferSamples || 72000;
+        const settings = options.processorOptions || {};
+        this.startBufferSamples = settings.startBufferSamples || 4096;
+        this.maxBufferSamples = settings.maxBufferSamples || 72000;
 
         this.port.onmessage = (event) => {
             const message = event.data;
-
-            if (!message || !message.type) {
-                return;
-            }
+            if (!message || !message.type) return;
 
             if (message.type === "audio") {
                 const samples = message.samples;
-
-                if (
-                    samples instanceof Float32Array &&
-                    samples.length > 0
-                ) {
+                if (samples instanceof Float32Array && samples.length > 0) {
                     this.queue.push(samples);
                     this.bufferedSamples += samples.length;
-
                     this.trimOldAudio();
 
-                    if (
-                        !this.started &&
-                        this.bufferedSamples >=
-                            this.startBufferSamples
-                    ) {
+                    if (!this.started && this.bufferedSamples >= this.startBufferSamples) {
                         this.started = true;
-
-                        this.port.postMessage({
-                            type: "playback-started"
-                        });
+                        this.port.postMessage({ type: "playback-started" });
                     }
                 }
             }
@@ -188,15 +142,8 @@ class PCMStreamProcessor extends AudioWorkletProcessor {
     }
 
     trimOldAudio() {
-        while (
-            this.bufferedSamples >
-                this.maxBufferSamples &&
-            this.queue.length > 0
-        ) {
-            const first = this.queue[0];
-            const remaining =
-                first.length - this.queueOffset;
-
+        while (this.bufferedSamples > this.maxBufferSamples && this.queue.length > 0) {
+            const remaining = this.queue[0].length - this.queueOffset;
             this.bufferedSamples -= remaining;
             this.queue.shift();
             this.queueOffset = 0;
@@ -208,9 +155,7 @@ class PCMStreamProcessor extends AudioWorkletProcessor {
             const first = this.queue[0];
 
             if (this.queueOffset < first.length) {
-                const sample =
-                    first[this.queueOffset];
-
+                const sample = first[this.queueOffset];
                 this.queueOffset += 1;
                 this.bufferedSamples -= 1;
 
@@ -230,48 +175,29 @@ class PCMStreamProcessor extends AudioWorkletProcessor {
     }
 
     process(inputs, outputs) {
-        const output = outputs[0];
-        const channel = output[0];
-
-        if (!channel) {
-            return true;
-        }
+        const channel = outputs[0][0];
+        if (!channel) return true;
 
         if (!this.started) {
             channel.fill(0);
             return true;
         }
 
-        for (
-            let index = 0;
-            index < channel.length;
-            index += 1
-        ) {
+        for (let index = 0; index < channel.length; index += 1) {
             channel[index] = this.readSample();
         }
 
         if (this.bufferedSamples <= 0) {
             this.started = false;
-
-            this.port.postMessage({
-                type: "buffer-underrun"
-            });
+            this.port.postMessage({ type: "buffer-underrun" });
         }
 
         return true;
     }
 }
 
-registerProcessor(
-    "pcm-stream-processor",
-    PCMStreamProcessor
-);
+registerProcessor("pcm-stream-processor", PCMStreamProcessor);
 `;
-
-
-/* ---------------------------------------------------------
-   UI helpers
---------------------------------------------------------- */
 
 function setConnectionStatus(text, state) {
     connectionStatus.textContent = text;
@@ -279,119 +205,83 @@ function setConnectionStatus(text, state) {
 }
 
 function updateMicrophoneStatus(connected) {
-    microphoneConnected = connected;
-
-    microphoneStatus.textContent = connected
-        ? "Connected"
-        : "Disconnected";
-
-    microphoneStatus.dataset.state = connected
-        ? "connected"
-        : "disconnected";
-}
-
-function updateListenerCount(count) {
-    listenerCount.textContent = String(count);
+    microphoneStatus.textContent = connected ? "Connected" : "Disconnected";
+    microphoneStatus.dataset.state = connected ? "connected" : "disconnected";
 }
 
 function updateLevel(samples) {
-    if (samples.length === 0) {
-        return;
-    }
+    if (samples.length === 0) return;
 
     let sumSquares = 0;
-
-    for (
-        let index = 0;
-        index < samples.length;
-        index += 1
-    ) {
-        const sample = samples[index];
+    for (const sample of samples) {
         sumSquares += sample * sample;
     }
 
-    const rms = Math.sqrt(
-        sumSquares / samples.length
-    );
-
-    const percentage = Math.min(
-        100,
-        Math.round(rms * 300)
-    );
+    const rms = Math.sqrt(sumSquares / samples.length);
+    const percentage = Math.min(100, Math.round(rms * 300));
 
     audioLevel.value = percentage;
     levelText.textContent = `${percentage}%`;
 }
 
-
-/* ---------------------------------------------------------
-   PCM conversion
---------------------------------------------------------- */
-
 function pcm16ToFloat32(arrayBuffer) {
     const view = new DataView(arrayBuffer);
-    const sampleCount = Math.floor(
-        arrayBuffer.byteLength / 2
-    );
+    const samples = new Float32Array(Math.floor(arrayBuffer.byteLength / 2));
 
-    const samples = new Float32Array(sampleCount);
-
-    for (
-        let index = 0;
-        index < sampleCount;
-        index += 1
-    ) {
-        const pcmValue = view.getInt16(
-            index * 2,
-            true
-        );
-
-        samples[index] = pcmValue / 32768;
+    for (let index = 0; index < samples.length; index += 1) {
+        samples[index] = view.getInt16(index * 2, true) / 32768;
     }
 
     return samples;
 }
 
+function applyAudioControls() {
+    const micGain = Number(micGainSlider.value);
+    const playbackVolume = Number(playbackVolumeSlider.value);
 
-/* ---------------------------------------------------------
-   Audio initialization
---------------------------------------------------------- */
+    micGainText.textContent = `${micGain.toFixed(2)}×`;
+    playbackVolumeText.textContent = `${Math.round(playbackVolume * 100)}%`;
+
+    if (!audioContext) return;
+
+    const now = audioContext.currentTime;
+
+    if (micGainNode) {
+        micGainNode.gain.setTargetAtTime(micGain, now, 0.015);
+    }
+
+    if (outputGainNode) {
+        outputGainNode.gain.setTargetAtTime(playbackVolume, now, 0.015);
+    }
+
+    if (limiterNode) {
+        limiterNode.threshold.setTargetAtTime(
+            limiterToggle.checked ? -3 : 0,
+            now,
+            0.015
+        );
+
+        limiterNode.ratio.setTargetAtTime(
+            limiterToggle.checked ? 20 : 1,
+            now,
+            0.015
+        );
+    }
+}
 
 async function createAudioPlayer() {
-    audioContext = new AudioContext({
-        latencyHint: "interactive"
-    });
-
+    audioContext = new AudioContext({ latencyHint: "interactive" });
     await audioContext.resume();
 
-    const workletBlob = new Blob(
-        [workletSource],
-        {
-            type: "application/javascript"
-        }
-    );
-
     const workletUrl = URL.createObjectURL(
-        workletBlob
+        new Blob([workletSource], { type: "application/javascript" })
     );
 
     try {
-        await audioContext.audioWorklet.addModule(
-            workletUrl
-        );
+        await audioContext.audioWorklet.addModule(workletUrl);
     } finally {
         URL.revokeObjectURL(workletUrl);
     }
-
-    const startBufferSamples = Math.round(
-        audioContext.sampleRate *
-        START_BUFFER_SECONDS
-    );
-
-    const maxBufferSamples = Math.round(
-        audioContext.sampleRate *
-        MAX_BUFFER_SECONDS
-    );
 
     workletNode = new AudioWorkletNode(
         audioContext,
@@ -400,120 +290,78 @@ async function createAudioPlayer() {
             numberOfInputs: 0,
             numberOfOutputs: 1,
             outputChannelCount: [1],
-
             processorOptions: {
-                startBufferSamples,
-                maxBufferSamples
+                startBufferSamples: Math.round(
+                    audioContext.sampleRate * START_BUFFER_SECONDS
+                ),
+                maxBufferSamples: Math.round(
+                    audioContext.sampleRate * MAX_BUFFER_SECONDS
+                )
             }
         }
     );
 
-    workletNode.port.onmessage = (event) => {
-        const message = event.data;
+    micGainNode = audioContext.createGain();
+    limiterNode = audioContext.createDynamicsCompressor();
+    outputGainNode = audioContext.createGain();
 
-        if (message.type === "playback-started") {
-            setConnectionStatus(
-                "Playing live audio",
-                "connected"
-            );
+    limiterNode.knee.value = 0;
+    limiterNode.attack.value = 0.003;
+    limiterNode.release.value = 0.15;
+
+    workletNode
+        .connect(micGainNode)
+        .connect(limiterNode)
+        .connect(outputGainNode)
+        .connect(audioContext.destination);
+
+    workletNode.port.onmessage = (event) => {
+        if (event.data.type === "playback-started") {
+            setConnectionStatus("Playing live audio", "connected");
         }
 
-        if (message.type === "buffer-underrun") {
-            if (
-                webSocket &&
-                webSocket.readyState === WebSocket.OPEN
-            ) {
-                setConnectionStatus(
-                    "Buffering audio...",
-                    "connecting"
-                );
+        if (event.data.type === "buffer-underrun") {
+            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                setConnectionStatus("Buffering audio...", "connecting");
             }
         }
     };
-
-    workletNode.connect(
-        audioContext.destination
-    );
 
     resampler = new StreamingResampler(
         SOURCE_SAMPLE_RATE,
         audioContext.sampleRate
     );
 
-    console.log(
-        `AudioContext sample rate: ` +
-        `${audioContext.sampleRate} Hz`
-    );
+    applyAudioControls();
 }
 
-
-/* ---------------------------------------------------------
-   WebSocket
---------------------------------------------------------- */
-
 function buildWebSocketUrl() {
-    const protocol =
-        window.location.protocol === "https:"
-            ? "wss:"
-            : "ws:";
-
-    return (
-        `${protocol}//` +
-        `${window.location.host}/listen`
-    );
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/listen`;
 }
 
 function connectWebSocket() {
     clearTimeout(reconnectTimer);
+    if (!shouldReconnect) return;
 
-    if (!shouldReconnect) {
-        return;
-    }
+    setConnectionStatus("Connecting to server...", "connecting");
 
-    setConnectionStatus(
-        "Connecting to server...",
-        "connecting"
-    );
-
-    const socketUrl = buildWebSocketUrl();
-
-    console.log(
-        `Connecting to ${socketUrl}`
-    );
-
-    webSocket = new WebSocket(socketUrl);
+    webSocket = new WebSocket(buildWebSocketUrl());
     webSocket.binaryType = "arraybuffer";
 
     webSocket.addEventListener("open", () => {
-        setConnectionStatus(
-            "Connected — waiting for audio",
-            "connected"
-        );
-
-        webSocket.send(
-            JSON.stringify({
-                type: "request-status"
-            })
-        );
+        setConnectionStatus("Connected — waiting for audio", "connected");
+        webSocket.send(JSON.stringify({ type: "request-status" }));
     });
 
-    webSocket.addEventListener(
-        "message",
-        handleWebSocketMessage
-    );
+    webSocket.addEventListener("message", handleWebSocketMessage);
 
     webSocket.addEventListener("close", () => {
-        setConnectionStatus(
-            "Server disconnected",
-            "disconnected"
-        );
-
+        setConnectionStatus("Server disconnected", "disconnected");
         updateMicrophoneStatus(false);
 
         if (workletNode) {
-            workletNode.port.postMessage({
-                type: "clear"
-            });
+            workletNode.port.postMessage({ type: "clear" });
         }
 
         if (resampler) {
@@ -521,17 +369,12 @@ function connectWebSocket() {
         }
 
         if (shouldReconnect) {
-            reconnectTimer = setTimeout(
-                connectWebSocket,
-                RECONNECT_DELAY_MS
-            );
+            reconnectTimer = setTimeout(connectWebSocket, RECONNECT_DELAY_MS);
         }
     });
 
     webSocket.addEventListener("error", () => {
-        console.error(
-            "WebSocket connection error"
-        );
+        console.error("WebSocket connection error");
     });
 }
 
@@ -541,31 +384,18 @@ function handleWebSocketMessage(event) {
         return;
     }
 
-    if (!(event.data instanceof ArrayBuffer)) {
+    if (!(event.data instanceof ArrayBuffer) || !workletNode || !resampler) {
         return;
     }
 
-    if (!workletNode || !resampler) {
-        return;
-    }
-
-    const sourceSamples =
-        pcm16ToFloat32(event.data);
-
+    const sourceSamples = pcm16ToFloat32(event.data);
     updateLevel(sourceSamples);
 
-    const outputSamples =
-        resampler.process(sourceSamples);
-
-    if (outputSamples.length === 0) {
-        return;
-    }
+    const outputSamples = resampler.process(sourceSamples);
+    if (outputSamples.length === 0) return;
 
     workletNode.port.postMessage(
-        {
-            type: "audio",
-            samples: outputSamples
-        },
+        { type: "audio", samples: outputSamples },
         [outputSamples.buffer]
     );
 }
@@ -575,48 +405,19 @@ function handleServerMessage(text) {
 
     try {
         message = JSON.parse(text);
-    } catch (error) {
-        console.warn(
-            "Invalid server message:",
-            text
-        );
-
+    } catch {
         return;
     }
 
     if (message.type === "status") {
-        updateMicrophoneStatus(
-            Boolean(message.microphoneConnected)
-        );
-
-        updateListenerCount(
-            Number(message.listenerCount || 0)
-        );
+        updateMicrophoneStatus(Boolean(message.microphoneConnected));
+        listenerCount.textContent = String(Number(message.listenerCount || 0));
 
         if (!message.microphoneConnected) {
-            setConnectionStatus(
-                "Waiting for ESP32 microphone",
-                "connecting"
-            );
+            setConnectionStatus("Waiting for ESP32 microphone", "connecting");
         }
-
-        return;
-    }
-
-    if (message.type === "audio-format") {
-        console.log(
-            "Audio format:",
-            message
-        );
-
-        return;
     }
 }
-
-
-/* ---------------------------------------------------------
-   Start and stop
---------------------------------------------------------- */
 
 async function startListening() {
     startButton.disabled = true;
@@ -632,23 +433,16 @@ async function startListening() {
 
         shouldReconnect = true;
         stopButton.disabled = false;
-
         connectWebSocket();
     } catch (error) {
         console.error(error);
-
-        setConnectionStatus(
-            `Audio error: ${error.message}`,
-            "disconnected"
-        );
-
+        setConnectionStatus(`Audio error: ${error.message}`, "disconnected");
         startButton.disabled = false;
     }
 }
 
 async function stopListening() {
     shouldReconnect = false;
-
     clearTimeout(reconnectTimer);
 
     if (webSocket) {
@@ -657,9 +451,7 @@ async function stopListening() {
     }
 
     if (workletNode) {
-        workletNode.port.postMessage({
-            type: "clear"
-        });
+        workletNode.port.postMessage({ type: "clear" });
     }
 
     if (resampler) {
@@ -670,48 +462,34 @@ async function stopListening() {
         await audioContext.suspend();
     }
 
-    setConnectionStatus(
-        "Stopped",
-        "disconnected"
-    );
-
+    setConnectionStatus("Stopped", "disconnected");
     updateMicrophoneStatus(false);
-    updateListenerCount(0);
-
+    listenerCount.textContent = "0";
     audioLevel.value = 0;
     levelText.textContent = "0%";
-
     startButton.disabled = false;
     stopButton.disabled = true;
 }
 
+function resetAudioControls() {
+    micGainSlider.value = "1";
+    playbackVolumeSlider.value = "0.7";
+    limiterToggle.checked = true;
+    applyAudioControls();
+}
 
-/* ---------------------------------------------------------
-   Events
---------------------------------------------------------- */
-
-startButton.addEventListener(
-    "click",
-    startListening
-);
-
-stopButton.addEventListener(
-    "click",
-    stopListening
-);
+startButton.addEventListener("click", startListening);
+stopButton.addEventListener("click", stopListening);
+micGainSlider.addEventListener("input", applyAudioControls);
+playbackVolumeSlider.addEventListener("input", applyAudioControls);
+limiterToggle.addEventListener("change", applyAudioControls);
+resetAudioButton.addEventListener("click", resetAudioControls);
 
 window.addEventListener("beforeunload", () => {
     shouldReconnect = false;
-
-    if (webSocket) {
-        webSocket.close();
-    }
+    if (webSocket) webSocket.close();
 });
 
-setConnectionStatus(
-    "Press Start Listening",
-    "disconnected"
-);
-
+setConnectionStatus("Press Start Listening", "disconnected");
 updateMicrophoneStatus(false);
-updateListenerCount(0);
+applyAudioControls();
